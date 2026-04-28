@@ -1,0 +1,138 @@
+"""
+spell_checker.py
+----------------
+Real-time spell checking:
+  - Takes a single word (or a full text).
+  - Returns whether each word is misspelled and up to 3 correction suggestions.
+
+Uses pyspellchecker (fast, offline, no Java needed).
+Falls back to TextBlob if pyspellchecker is unavailable.
+"""
+
+from __future__ import annotations
+import re
+
+# ── Try pyspellchecker (preferred) ────────────────────────────────────────────
+_spell = None
+
+def _load_spellchecker():
+    global _spell
+    if _spell is not None:
+        return True
+    try:
+        from spellchecker import SpellChecker
+        _spell = SpellChecker()
+        print("[Spell] pyspellchecker loaded.")
+        return True
+    except ImportError:
+        print("[Spell] pyspellchecker not found, trying TextBlob…")
+        return False
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+_WORD_RE    = re.compile(r"\b[a-zA-Z']{2,}\b")
+_SKIP_WORDS = {
+    # Common proper nouns / abbreviations that spellcheckers flag but are fine
+    "fastapi", "gpt", "nlp", "ai", "api", "doi", "html", "css",
+    "fig", "et", "al", "viz", "vs", "fig", "eq",
+}
+
+
+def _suggestions_pyspell(word: str) -> list[str]:
+    if _spell is None:
+        return []
+    candidates = _spell.candidates(word)
+    if not candidates:
+        return []
+    # Sort candidates by edit distance (SpellChecker already ranks them)
+    known = _spell.known(candidates)
+    result = sorted(known or candidates)[:3]
+    return list(result)
+
+
+def _suggestions_textblob(word: str) -> list[str]:
+    try:
+        from textblob import Word
+        suggestions = Word(word).spellcheck()
+        # Returns [(word, confidence), ...]
+        return [s[0] for s in suggestions[:3]]
+    except Exception:
+        return []
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def check_word(word: str) -> dict:
+    """
+    Check a single `word`.
+    Returns:
+        { "word": str, "correct": bool, "suggestions": [str, ...] }
+    """
+    clean = word.strip().lower()
+    if not clean or clean in _SKIP_WORDS or len(clean) < 2:
+        return {"word": word, "correct": True, "suggestions": []}
+
+    loaded = _load_spellchecker()
+
+    if loaded and _spell:
+        correct = len(_spell.unknown([clean])) == 0
+        suggestions = [] if correct else _suggestions_pyspell(clean)
+    else:
+        # TextBlob fallback
+        suggestions = _suggestions_textblob(clean)
+        correct = (len(suggestions) == 0) or (suggestions[0].lower() == clean)
+
+    return {
+        "word":        word,
+        "correct":     correct,
+        "suggestions": suggestions,
+    }
+
+
+def check_text(text: str) -> list[dict]:
+    """
+    Check all words in `text`.
+    Returns a list of dicts for *misspelled* words only, each containing:
+        {
+            "word":        original word,
+            "correct":     False,
+            "suggestions": [up to 3 correction strings],
+            "positions":   [ {"start": int, "end": int}, ... ]
+                           (all character positions of this word in text)
+        }
+    """
+    if not text or not text.strip():
+        return []
+
+    loaded = _load_spellchecker()
+
+    # Collect all word positions
+    positions: dict[str, list[dict]] = {}
+    for m in _WORD_RE.finditer(text):
+        w   = m.group()
+        key = w.lower()
+        if key not in positions:
+            positions[key] = []
+        positions[key].append({"start": m.start(), "end": m.end()})
+
+    errors = []
+    for word_lower, locs in positions.items():
+        if word_lower in _SKIP_WORDS or len(word_lower) < 2:
+            continue
+
+        if loaded and _spell:
+            correct = len(_spell.unknown([word_lower])) == 0
+            suggestions = [] if correct else _suggestions_pyspell(word_lower)
+        else:
+            suggestions = _suggestions_textblob(word_lower)
+            correct = (not suggestions) or (suggestions[0].lower() == word_lower)
+
+        if not correct:
+            errors.append({
+                "word":        word_lower,
+                "correct":     False,
+                "suggestions": suggestions,
+                "positions":   locs,
+            })
+
+    return errors
